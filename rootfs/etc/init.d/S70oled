@@ -1,0 +1,53 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ssd1315_oled mpu6050
+# Required-Start:    $local_fs
+# Required-Stop:     $local_fs
+# Default-Start:     S
+# Default-Stop:      0 6
+# Short-Description: Load SSD1315 OLED and MPU6050 IMU drivers
+### END INIT INFO
+
+OLED_DRIVER="ssd1315_oled"
+IMU_DRIVER="inv_mpu6050_i2c"
+OLED_DEV="/dev/ssd1315"
+
+case "$1" in
+  start)
+    echo "Loading SSD1315 OLED driver..."
+    modprobe $OLED_DRIVER
+    if [ $? -eq 0 ]; then
+        echo "  $OLED_DRIVER loaded — device: $OLED_DEV"
+    else
+        echo "  ERROR: failed to load $OLED_DRIVER" >&2
+    fi
+
+    echo "Loading MPU6050 IMU driver..."
+    modprobe $IMU_DRIVER
+    if [ $? -eq 0 ]; then
+        echo "  $IMU_DRIVER loaded — data via /sys/bus/iio/devices/"
+    else
+        echo "  ERROR: failed to load $IMU_DRIVER" >&2
+    fi
+    ;;
+  stop)
+    echo "Unloading drivers..."
+    rmmod $IMU_DRIVER  2>/dev/null || true
+    rmmod $OLED_DRIVER 2>/dev/null || true
+    ;;
+  status)
+    for drv in $OLED_DRIVER $IMU_DRIVER; do
+        if lsmod | grep -q "^${drv}"; then
+            echo "$drv is loaded"
+        else
+            echo "$drv is NOT loaded"
+        fi
+    done
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|status}"
+    exit 1
+    ;;
+esac
+
+exit 0

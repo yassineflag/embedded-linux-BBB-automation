@@ -1,0 +1,28 @@
+# Build outputs
+output/
+src/
+*.img
+
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Temporary / logs
+*.log
+*.tmp

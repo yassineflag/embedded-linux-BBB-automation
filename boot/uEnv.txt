@@ -1,0 +1,23 @@
+##############################################################################
+# uEnv.txt — U-Boot environment for BeagleBone Black
+# Located in FAT32 partition (partition 1 of SD card)
+##############################################################################
+
+console=ttyO0,115200n8
+fdtfile=am335x-boneblack.dtb
+loadaddr=0x82000000
+fdtaddr=0x88000000
+overlayaddr=0x89000000
+
+# Load zImage and DTB from FAT partition (mmc 0:1)
+loadimage=load mmc 0:1 ${loadaddr} zImage
+loaddtb=load mmc 0:1 ${fdtaddr} ${fdtfile}
+
+# Load DT overlay for SSD1315 + MPU6050 (optional — patch DTB at runtime)
+# loadoverlay=load mmc 0:1 ${overlayaddr} bbb-ssd1315-mpu6050.dtbo; fdt addr ${fdtaddr}; fdt resize 0x1000; fdt apply ${overlayaddr}
+
+# Kernel boot args — root on ext4 partition 2
+bootargs=console=${console} root=/dev/mmcblk0p2 rw rootfstype=ext4 rootwait panic=10 quiet
+
+# Boot command
+uenvcmd=run loadimage; run loaddtb; bootz ${loadaddr} - ${fdtaddr}
