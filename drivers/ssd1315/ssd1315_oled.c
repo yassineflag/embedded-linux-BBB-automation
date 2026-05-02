@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+// Copyright (C) 2026 Yassine El H. @yassineflag
 /*
  * SSD1315 OLED Display — Linux I2C Kernel Driver
  *

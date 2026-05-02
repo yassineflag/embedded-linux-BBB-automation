@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# scripts/build-rootfs.sh — Build a minimal BusyBox rootfs
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Yassine El H. @yassineflag
+# scripts/build-rootfs.sh: Build a minimal BusyBox rootfs
 set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"

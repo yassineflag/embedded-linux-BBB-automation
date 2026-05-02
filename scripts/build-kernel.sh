@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# scripts/build-kernel.sh — Clone and cross-compile Linux kernel for BeagleBone Black
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Yassine El H. @yassineflag
+# scripts/build-kernel.sh: Clone and cross-compile Linux kernel for BeagleBone Black
 set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"

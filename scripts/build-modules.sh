@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# scripts/build-modules.sh — Build and install ssd1315_oled out-of-tree kernel module
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Yassine El H. @yassineflag
+# scripts/build-modules.sh: Build and install ssd1315_oled out-of-tree kernel module
 set -euo pipefail
 
 TOP="$(cd "$(dirname "$0")/.." && pwd)"

@@ -1,17 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright (C) 2026 Yassine El H. @yassineflag
+
 /*
- * oled_test.c — Userspace test app for SSD1315 OLED + MPU6050 + 4 buttons
+ * oled_test.c: Userspace test app for SSD1315 OLED + MPU6050 + 4 buttons
  *
  * Usage: oled-test [mode]
- *   mode 0  — show checkerboard on OLED (default)
- *   mode 1  — all pixels ON
- *   mode 2  — clear display
- *   mode 3  — stream MPU6050 accel/gyro data to stdout + show bar on OLED
- *   mode 4  — wait for button presses and print which button was pressed
+ *   mode 0  show checkerboard on OLED (default)
+ *   mode 1  all pixels ON
+ *   mode 2  clear display
+ *   mode 3  stream MPU6050 accel/gyro data to stdout + show bar on OLED
+ *   mode 4  wait for button presses and print which button was pressed
  *
  * Devices used:
- *   /dev/ssd1315          — SSD1315 OLED (our kernel module)
- *   /sys/bus/iio/devices/ — MPU6050 via in-tree IIO driver
- *   /dev/input/eventX     — GPIO buttons via gpio-keys driver
+ *   /dev/ssd1315          SSD1315 OLED (out-of-tree kernel module)
+ *   /sys/bus/iio/devices/ MPU6050 via in-tree IIO driver
+ *   /dev/input/eventX     GPIO buttons via gpio-keys driver
  */
 
 #include <stdio.h>

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# scripts/make-image.sh — Assemble bootable SD card image
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Yassine El H. @yassineflag
+# scripts/make-image.sh: Assemble bootable SD card image
 #
 # Creates sdcard.img with:
 #   Partition 1: FAT32 64MB (boot: MLO, u-boot.img, uEnv.txt, zImage, DTB)
