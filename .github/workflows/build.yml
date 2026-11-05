@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh rootfs/etc/init.d/S70oled
+
+      - name: checkpatch (driver)
+        run: |
+          base=https://raw.githubusercontent.com/gregkh/linux/v6.6.21/scripts
+          mkdir -p /tmp/cp
+          for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
+            curl -sSfL -o /tmp/cp/$f $base/$f
+          done
+          perl /tmp/cp/checkpatch.pl --no-tree --strict --terse --show-types \
+            -f drivers/ssd1315/ssd1315_oled.c drivers/ssd1315/ssd1315_ioctl.h
+
+  build:
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-dev-armhf-cross \
+            make git wget bzip2 bc bison flex libssl-dev \
+            device-tree-compiler kmod \
+            fdisk dosfstools mtools e2fsprogs fakeroot
+
+      # Sources and their build trees: later runs only rebuild what changed
+      - uses: actions/cache@v4
+        with:
+          path: src
+          key: src-${{ runner.os }}-${{ hashFiles('scripts/env.sh') }}
+
+      - name: Build U-Boot, kernel, rootfs, driver, image
+        run: make all
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbb-sdcard
+          path: |
+            output/sdcard.img
+            output/boot/
+          compression-level: 9

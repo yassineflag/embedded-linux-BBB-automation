@@ -1,251 +1,208 @@
 # build-rootfs.sh: Deep Dive
 
-A detailed walkthrough of every step in `scripts/build-rootfs.sh`, which assembles a minimal Linux root filesystem using **BusyBox** for the BeagleBone Black.
+A walkthrough of `scripts/build-rootfs.sh`, which assembles a minimal **BusyBox** root filesystem for the BeagleBone Black, and of how the rest of the pipeline finishes it.
 
 ---
 
 ## What is a RootFS?
 
-The root filesystem is everything the kernel mounts at `/` after boot. It contains all the userspace binaries, libraries, configuration files, and device nodes. On an embedded system this is typically kept as small as possible. We use **BusyBox** to get an entire shell + core Unix utilities in a single ~1 MB static binary.
+The root filesystem is everything the kernel mounts at `/` after boot: userspace binaries, libraries, configuration files and init scripts. On an embedded system it is kept as small as possible. **BusyBox** gives us a shell plus the core Unix utilities in a single ~1 MB static binary.
 
 ---
 
-## Step-by-Step Breakdown
+## Step by Step
 
-### 1. Safety flags and path setup
+### 1. Shared environment
 
 ```bash
 set -euo pipefail
-TOP="$(cd "$(dirname "$0")/.." && pwd)"
+STEP=ROOTFS
+. "$(dirname "$0")/env.sh"
 ```
 
 | Flag | Effect |
 |------|--------|
 | `-e` | Exit immediately if any command fails |
 | `-u` | Treat unset variables as errors |
-| `-o pipefail` | A pipe fails if **any** command in it fails (not just the last) |
+| `-o pipefail` | A pipe fails if **any** command in it fails |
 
-`TOP` resolves to the project root regardless of where you call the script from, making all paths relative to the repo.
-
----
-
-### 2. BusyBox configuration
-
-```bash
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" defconfig
-```
-
-Runs BusyBox's built-in `defconfig` target, which generates a `.config` file with a sensible set of enabled applets (shell, coreutils, networking tools, init, etc.) pre-selected for the target architecture.
-
-`ARCH=arm` and `CROSS_COMPILE=arm-linux-gnueabihf-` tell BusyBox's Kconfig system we're building for 32-bit ARM with the hard-float ABI.
+`scripts/env.sh` is sourced by every script. It defines `TOP`, the `src/` and `output/` paths, `CROSS_COMPILE`, `JOBS` and the pinned versions (`BUSYBOX_VERSION`, `BUSYBOX_SHA256`, ...). Every value can be overridden from the environment or from `make`, for example `make BUSYBOX_VERSION=... rootfs`.
 
 ---
 
-### 3. Enable static linking
+### 2. Fetch BusyBox, checksum verified
 
 ```bash
-sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "${SRC}/.config"
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" oldconfig -s
+wget -q -O "${TARBALL}" "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2"
+echo "${BUSYBOX_SHA256}  ${TARBALL}" | sha256sum -c --quiet -
 ```
 
-**Why static?**  
-A dynamically linked BusyBox requires `glibc` (or `musl`) shared libraries to be present in the rootfs under `/lib`. Building statically links everything into the single `busybox` binary, no shared libs needed, no `ld.so`, simpler rootfs.
-
-The `sed` patches the `.config` directly (the quickest way to flip a single option), then `oldconfig` re-validates the configuration to resolve any dependencies that may have changed.
+The tarball is kept in `src/` and verified against a pinned SHA256 before extraction, so a corrupted or tampered download fails the build instead of producing a broken image.
 
 ---
 
-### 4. Cross-compile BusyBox
+### 3. Configure: defconfig, static, no `tc`
 
 ```bash
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)"
+make defconfig
+sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+       -e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+make oldconfig < /dev/null
 ```
 
-Compiles every enabled applet and links them all into a single `busybox` binary. `-j$(nproc)` parallelises the build across all available CPU cores. The output is `src/busybox/busybox`, an ARM ELF binary.
+Configuration only happens when `src/busybox/.config` does not exist, so local tweaks made with `make -C src/busybox menuconfig` survive rebuilds.
+
+**Why static?** A dynamically linked BusyBox needs glibc and `ld-linux-armhf.so.3` in `/lib`. Static linking puts everything into the single `busybox` binary. glibc prints warnings about `getpwnam` and friends in static binaries: they are harmless for this rootfs.
+
+**Why no `tc`?** The `tc` applet in BusyBox 1.36.1 uses the CBQ qdisc definitions that were removed from the kernel UAPI headers in Linux 6.8. Cross toolchains on Ubuntu 24.04 and newer ship those headers, so `tc` fails to compile.
 
 ---
 
-### 5. Install BusyBox into the rootfs
+### 4. Build and install
 
 ```bash
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" \
-    CONFIG_PREFIX="${ROOTFS}" install
+make -j"${JOBS}"
+rm -rf "${ROOTFS_OUT}"
+make CONFIG_PREFIX="${ROOTFS_OUT}" install
 ```
 
-BusyBox's install target creates the following layout under `output/rootfs/`:
-
-```
-output/rootfs/
-├── bin/
-│   ├── busybox       <- the real binary
-│   ├── sh -> busybox <- symlink
-│   ├── ls -> busybox <- symlink
-│   └── ...           <- hundreds of symlinks
-├── sbin/
-│   └── ...
-└── usr/
-    └── ...
-```
-
-Every applet (ls, cat, sh, mount, modprobe ...) is just a **symlink** pointing back to the same `busybox` binary. BusyBox reads `argv[0]` at runtime to know which applet to run.
+The rootfs directory is **deleted and recreated on every run**: stale files from an earlier build can never leak into the image. BusyBox's install target creates `bin/`, `sbin/`, `usr/bin/`, `usr/sbin/` where every applet (`ls`, `sh`, `mount`, `modprobe` ...) is a symlink to `bin/busybox`. BusyBox looks at `argv[0]` to pick the applet.
 
 ---
 
-### 6. Create the essential directory skeleton
+### 5. Directory skeleton
 
 ```bash
-mkdir -p "${ROOTFS}"/{proc,sys,dev,tmp,run,mnt,boot,etc/init.d,usr/bin,usr/sbin,lib/modules}
+mkdir -p "${ROOTFS_OUT}"/{dev,proc,sys,tmp,run,mnt,root,etc/init.d,usr/bin,usr/sbin,lib/modules}
+chmod 1777 "${ROOTFS_OUT}/tmp"
 ```
-
-These are **mount points and directories required by Linux** at runtime:
 
 | Directory | Purpose |
 |-----------|---------|
-| `/proc` | Virtual FS, kernel exposes process info, CPU info, etc. |
-| `/sys` | Virtual FS, kernel exposes device/driver model (sysfs) |
-| `/dev` | Device nodes (tty, null, zero, i2c, ...) |
-| `/tmp` | Temporary files (mounted as tmpfs, lives in RAM) |
-| `/run` | Runtime data (PIDs, sockets) |
-| `/mnt` | Convenient manual mount point |
-| `/boot` | Placeholder (kernel + DTB live in FAT partition) |
-| `/etc/init.d` | SysV init scripts |
-| `/usr/bin` | Userspace binaries (oled-test will go here) |
-| `/lib/modules` | Kernel modules (`ssd1315_oled.ko` and `inv_mpu6050_i2c.ko` go here) |
-
-Without these directories, `mount`, `modprobe`, and most init scripts fail immediately.
+| `/proc`, `/sys` | Mount points for procfs and sysfs |
+| `/dev` | Mount point for devtmpfs (mounted by the kernel) |
+| `/tmp`, `/run` | tmpfs mount points (RAM) |
+| `/root` | Home of the root user |
+| `/etc/init.d` | `rcS`, `rcK` and the `S??*` service scripts |
+| `/lib/modules` | Kernel modules and the `modules.dep` database |
 
 ---
 
-### 7. Create `/etc/inittab`
+### 6. `/etc/inittab`
 
-```bash
-cat > "${ROOTFS}/etc/inittab" << 'EOF'
+```
 ::sysinit:/etc/init.d/rcS
-::askfirst:-/bin/sh
+ttyS0::askfirst:-/bin/sh
 ::ctrlaltdel:/sbin/reboot
-::shutdown:/sbin/swapoff -a
+::shutdown:/etc/init.d/rcK
 ::shutdown:/bin/umount -a -r
-EOF
 ```
 
-`inittab` is the configuration file for BusyBox `init`, the first userspace process (PID 1) started by the kernel. Each line is: `id:runlevels:action:process`
+BusyBox `init` (PID 1) reads this file. Format: `tty:runlevels:action:process` (runlevels are ignored by BusyBox).
 
 | Line | Meaning |
 |------|---------|
-| `::sysinit:/etc/init.d/rcS` | Run `rcS` once at startup before anything else |
-| `::askfirst:-/bin/sh` | Give a login shell on the console (the `-` prefix means login shell) |
-| `::ctrlaltdel:/sbin/reboot` | Ctrl+Alt+Del triggers a clean reboot |
-| `::shutdown:...` | On shutdown, unmount filesystems cleanly to avoid corruption |
+| `::sysinit:/etc/init.d/rcS` | Run once at boot, before anything else |
+| `ttyS0::askfirst:-/bin/sh` | "Press Enter" then a login shell on the debug UART |
+| `::shutdown:/etc/init.d/rcK` | Stop services (`S??* stop`) in reverse order |
+| `::shutdown:/bin/umount -a -r` | Unmount, or remount read only, before power off |
+
+The shell is bound to **`ttyS0`, not `/dev/console`**. `/dev/console` can not be a controlling terminal, so a shell on it has no job control and **Ctrl+C does not send SIGINT** to foreground programs. `oled-test 3` and `oled-test 4` rely on Ctrl+C to stop. On kernel 6.6 the AM335x UART is driven by `8250_omap`, so the device is `ttyS0` (the old `ttyO0` name only works through a compatibility fixup).
 
 ---
 
-### 8. Create `/etc/init.d/rcS`
+### 7. `/etc/init.d/rcS`
 
-```bash
-cat > "${ROOTFS}/etc/init.d/rcS" << 'EOF'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+```sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -a
+hostname -F /etc/hostname
 echo /sbin/mdev > /proc/sys/kernel/hotplug
-
-for script in /etc/init.d/S??*; do
-    [ -x "$script" ] && "$script" start
-done
-EOF
+mdev -s
+for s in /etc/init.d/S??*; do [ -x "$s" ] && "$s" start; done
 ```
 
-`rcS` is the **system initialisation script** called by `init` at boot. It runs in order:
+1. **procfs and sysfs** first: `ps`, `modprobe`, `mdev` and IIO all depend on them.
+2. **devtmpfs** is normally already on `/dev`: the kernel config fragment sets `CONFIG_DEVTMPFS_MOUNT=y`, so the kernel mounts it right after the root filesystem. The `mountpoint` check keeps the script correct on kernels without that option.
+3. **`mount -a`** mounts what `/etc/fstab` lists: `/tmp`, `/run` and `/dev/pts`.
+4. **`hostname -F`**: the kernel does not read `/etc/hostname` by itself, userspace has to.
+5. **mdev**: registered as hotplug helper for devices that appear later, and `mdev -s` does one coldplug pass for the ones already there. devtmpfs already creates the nodes, mdev adds permissions and symlinks if `/etc/mdev.conf` asks for them.
+6. **`S??*` scripts** run in glob order, which is alphabetical: `S70oled` loads `ssd1315_oled` and `inv_mpu6050_i2c`. Pick the number to control ordering.
 
-1. **`mount -t proc none /proc`**: the kernel needs `/proc` to expose process/system information. Without this, commands like `ps`, `free`, `cat /proc/cpuinfo` are broken.
-
-2. **`mount -t sysfs none /sys`**: mounts the sysfs virtual filesystem, required for `udev`/`mdev` to enumerate devices and for any driver interaction via sysfs attributes.
-
-3. **`mount -t devtmpfs none /dev || mdev -s`**: populates `/dev` with device nodes.
-   - `devtmpfs`: the kernel itself creates device nodes automatically as drivers register (preferred).
-   - `mdev -s` (fallback): BusyBox's lightweight `udev` replacement; scans `/sys` and creates nodes manually if `devtmpfs` isn't available.
-
-4. **`echo /sbin/mdev > /proc/sys/kernel/hotplug`**: registers `mdev` as the hotplug handler so that devices plugged in after boot (USB, I2C devices loaded by modules) also get their `/dev` nodes created.
-
-5. **`for script in /etc/init.d/S??*`**: runs all init scripts matching `S` + two digits + anything, in **alphabetical order**. This is the standard SysV convention:
-   - `S70oled` loads `ssd1315_oled` and `inv_mpu6050_i2c` kernel modules
-   - Higher numbers run later; you control startup order by choosing the number.
+`rcK` is the mirror image, run at shutdown: every `S??*` script with `stop`, highest number first.
 
 ---
 
-### 9. Create `/etc/fstab`
+### 8. `/etc/fstab`
+
+```
+tmpfs   /tmp      tmpfs   mode=1777  0 0
+tmpfs   /run      tmpfs   mode=0755  0 0
+devpts  /dev/pts  devpts  defaults   0 0
+```
+
+Only what `mount -a` should mount. proc and sysfs are mounted explicitly by `rcS`, and devtmpfs by the kernel: listing them here would make `mount -a` try to mount them a second time.
+
+---
+
+### 9. Users, profile, hostname
 
 ```bash
-cat > "${ROOTFS}/etc/fstab" << 'EOF'
-proc      /proc  proc      defaults  0 0
-sysfs     /sys   sysfs     defaults  0 0
-devtmpfs  /dev   devtmpfs  defaults  0 0
-tmpfs     /tmp   tmpfs     defaults  0 0
-EOF
+echo "root:x:0:0:root:/root:/bin/sh" > etc/passwd
+echo "root:x:0:"                     > etc/group
+echo "bbb-oled"                      > etc/hostname
 ```
 
-`fstab` tells `mount -a` (and some init systems) which filesystems to mount. Even though `rcS` mounts proc/sys/dev manually, having them in `fstab` ensures tools like `df` and `findmnt` show them correctly. `/tmp` as `tmpfs` means temp files live in RAM (fast, and disappear on reboot).
+`/etc/passwd` and `/etc/group` let `ls -l`, `id` and the shell prompt resolve uid 0 to `root`. `/etc/profile` sets `PATH` and a `user@host:dir#` prompt for the login shell.
 
 ---
 
-### 10. Set hostname
+### 10. Service script
 
 ```bash
-echo "bbb-oled" > "${ROOTFS}/etc/hostname"
+install -m 755 "${TOP}/rootfs/etc/init.d/S70oled" "${ROOTFS_OUT}/etc/init.d/S70oled"
 ```
 
-The kernel reads this at boot and sets the system hostname. Shows up in the shell prompt and in `hostname` command output.
+`rcS` only runs scripts that are executable (`[ -x "$s" ]`), hence `install -m 755`.
 
 ---
 
-### 11. Install the OLED init script
+### 11. In tree kernel modules
 
 ```bash
-cp "${TOP}/rootfs/etc/init.d/S70oled" "${ROOTFS}/etc/init.d/S70oled"
-chmod +x "${ROOTFS}/etc/init.d/S70oled"
+cp -a "${MODULES_OUT}/lib/modules/." "${ROOTFS_OUT}/lib/modules/"
+rm -f "${ROOTFS_OUT}"/lib/modules/*/build "${ROOTFS_OUT}"/lib/modules/*/source
 ```
 
-Copies our custom `S70oled` script into the rootfs so it gets picked up by `rcS`'s `for` loop on boot. The `chmod +x` is critical: `rcS` checks `[ -x "$script" ]` before running it.
+`build-kernel.sh` runs `modules_install INSTALL_MOD_PATH=output/modules INSTALL_MOD_STRIP=1`, which already produces `modules.dep`, `modules.alias` and friends. They are copied as is. The `build` and `source` symlinks point into the host's kernel tree and mean nothing on the target, so they are removed.
 
 ---
 
-### 12. Install kernel modules
+## After build-rootfs.sh
 
-```bash
-if [ -d "${MODULES_OUT}" ]; then
-    cp -a "${MODULES_OUT}/lib/modules" "${ROOTFS}/lib/"
-    KVER=$(ls "${MODULES_OUT}/lib/modules/" | head -1)
-    depmod -b "${ROOTFS}" "${KVER}" 2>/dev/null || true
-fi
-```
-
-- **`cp -a`**: copies the entire module tree preserving symlinks and permissions. `modules_install` (run by `build-kernel.sh`) creates:
-  ```
-  output/modules/lib/modules/6.6.21-.../{kernel/,extra/,modules.dep,...}
-  ```
-
-- **`depmod -b "${ROOTFS}" "${KVER}"`**: generates `modules.dep` and `modules.alias` inside the rootfs. These files are what `modprobe` reads to resolve module dependencies. Without running `depmod`, `modprobe ssd1315_oled` would fail even if the `.ko` file is present, because `modprobe` (unlike `insmod`) relies on the dependency database.
-
-> **Note:** The `|| true` prevents the script from failing if `depmod` isn't installed on the host; `build-modules.sh` also runs `depmod` after installing the `.ko`, so this is a safety net.
-
----
+| Step | Script | What it adds |
+|------|--------|--------------|
+| `make modules` | `build-modules.sh` | `ssd1315_oled.ko` via kbuild `modules_install` into `lib/modules/<release>/updates/`, then `depmod` so `modprobe ssd1315_oled` works |
+| `make oled-test` | `build-oled-test.sh` | `/usr/bin/oled-test` (static) |
+| `make image` | `make-image.sh` | Packs the tree into ext4 with `mkfs.ext4 -d` inside **fakeroot**, so every file is owned by `root:root` on the target although the build ran as a normal user |
 
 ## Output
 
-After the script completes, `output/rootfs/` is a fully populated directory tree ready to be packed into an ext4 partition:
-
 ```
 output/rootfs/
-├── bin/          <- BusyBox applets (sh, ls, cat, mount, modprobe...)
-├── sbin/
-├── usr/bin/      <- oled-test (installed by build-oled-test.sh)
-├── lib/modules/  <- ssd1315_oled.ko + inv_mpu6050_i2c.ko + modules.dep
+├── bin/ sbin/ usr/bin/ usr/sbin/   <- BusyBox applets, oled-test
+├── lib/modules/<release>/
+│   ├── kernel/...                  <- in tree modules (inv_mpu6050_i2c.ko ...)
+│   ├── updates/ssd1315_oled.ko     <- out of tree driver
+│   └── modules.dep, modules.alias ...
 ├── etc/
-│   ├── inittab
-│   ├── fstab
-│   ├── hostname
+│   ├── inittab  fstab  profile  passwd  group  hostname
 │   └── init.d/
-│       ├── rcS       <- system init
-│       └── S70oled   <- loads OLED driver
-├── proc/  sys/  dev/  tmp/  run/  mnt/
+│       ├── rcS       <- boot
+│       ├── rcK       <- shutdown
+│       └── S70oled   <- loads the OLED and IMU drivers
+├── dev/ proc/ sys/ tmp/ run/ mnt/ root/
 ```
