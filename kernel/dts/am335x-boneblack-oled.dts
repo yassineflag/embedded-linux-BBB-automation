@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2026 Yassine El H. @yassineflag
+ *
+ * BeagleBone Black + SSD1315 OLED + MPU6050 IMU + 4 push buttons.
+ *
+ * Built as a full board DTB on top of the upstream am335x-boneblack.dts,
+ * so no overlay support (dtc -@, U-Boot fdt apply) is needed.
+ *
+ * I2C2 (P9.19 SCL, P9.20 SDA, already muxed by am335x-bone-common.dtsi):
+ *   0x3c  SSD1315 OLED (0x3d if SA0 is high)
+ *   0x68  MPU6050 IMU  (0x69 if AD0 is high)
+ *   0x54..0x57 cape EEPROMs from the base tree, left untouched
+ *
+ * Buttons, active low, internal pull up, other leg to GND (P8.1 / P8.2):
+ *   BTN_1  P8.7   gpmc_advn_ale  gpio2_2
+ *   BTN_2  P8.8   gpmc_oen_ren   gpio2_3
+ *   BTN_3  P8.9   gpmc_be0n_cle  gpio2_5
+ *   BTN_4  P8.10  gpmc_wen       gpio2_4
+ */
+
+#include "am335x-boneblack.dts"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+&am33xx_pinmux {
+	button_pins: button-pins {
+		pinctrl-single,pins = <
+			AM33XX_PADCONF(AM335X_PIN_GPMC_ADVN_ALE, PIN_INPUT_PULLUP, MUX_MODE7)	/* P8.7  gpio2_2 */
+			AM33XX_PADCONF(AM335X_PIN_GPMC_OEN_REN, PIN_INPUT_PULLUP, MUX_MODE7)	/* P8.8  gpio2_3 */
+			AM33XX_PADCONF(AM335X_PIN_GPMC_BEN0_CLE, PIN_INPUT_PULLUP, MUX_MODE7)	/* P8.9  gpio2_5 */
+			AM33XX_PADCONF(AM335X_PIN_GPMC_WEN, PIN_INPUT_PULLUP, MUX_MODE7)	/* P8.10 gpio2_4 */
+		>;
+	};
+};
+
+&i2c2 {
+	/* Base tree runs the bus at 100 kHz. All devices here support 400 kHz */
+	clock-frequency = <400000>;
+
+	oled@3c {
+		compatible = "solomon,ssd1315";
+		reg = <0x3c>;
+	};
+
+	imu@68 {
+		compatible = "invensense,mpu6050";
+		reg = <0x68>;
+		/*
+		 * Optional INT wiring, for example on P9.12 (gpio1_28):
+		 *   interrupt-parent = <&gpio1>;
+		 *   interrupts = <28 IRQ_TYPE_EDGE_RISING>;
+		 * plus a MUX_MODE7 input entry in a pinctrl group.
+		 */
+	};
+};
+
+/ {
+	gpio-buttons {
+		compatible = "gpio-keys";
+		label = "bbb-gpio-buttons";
+		pinctrl-names = "default";
+		pinctrl-0 = <&button_pins>;
+
+		button-1 {
+			label = "BTN_1";
+			linux,code = <BTN_0>;
+			gpios = <&gpio2 2 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		button-2 {
+			label = "BTN_2";
+			linux,code = <BTN_1>;
+			gpios = <&gpio2 3 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		button-3 {
+			label = "BTN_3";
+			linux,code = <BTN_2>;
+			gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+
+		button-4 {
+			label = "BTN_4";
+			linux,code = <BTN_3>;
+			gpios = <&gpio2 4 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+	};
+};
