@@ -1,80 +1,134 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2026 Yassine El H. @yassineflag
-# scripts/build-rootfs.sh: Build a minimal BusyBox rootfs
+# scripts/build-rootfs.sh: build a minimal static BusyBox root filesystem
+#
+# The rootfs is rebuilt from scratch on every run so stale files never leak
+# into the image. File ownership is fixed later, inside fakeroot, by
+# scripts/make-image.sh: nothing here needs root.
 set -euo pipefail
+STEP=ROOTFS
+# shellcheck source=env.sh
+. "$(dirname "$0")/env.sh"
 
-TOP="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${TOP}/src/busybox"
-ROOTFS="${TOP}/output/rootfs"
-CROSS_COMPILE="${CROSS_COMPILE:-arm-linux-gnueabihf-}"
-MODULES_OUT="${TOP}/output/modules"
+need_cmd wget sha256sum tar "${CROSS_COMPILE}gcc"
 
-echo "[ROOTFS] Configuring BusyBox..."
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+# ---------------------------------------------------------------------------
+# 1. Fetch BusyBox (checksum verified)
+# ---------------------------------------------------------------------------
+TARBALL="${SRC_DIR}/busybox-${BUSYBOX_VERSION}.tar.bz2"
+mkdir -p "${SRC_DIR}"
+if [ ! -d "${BUSYBOX_SRC}" ]; then
+    if [ ! -f "${TARBALL}" ]; then
+        log "Downloading BusyBox ${BUSYBOX_VERSION}"
+        # .part + mv: a failed download never leaves a truncated tarball behind
+        wget -q -O "${TARBALL}.part" \
+            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" || \
+            { rm -f "${TARBALL}.part"; die "download failed"; }
+        mv "${TARBALL}.part" "${TARBALL}"
+    fi
+    echo "${BUSYBOX_SHA256}  ${TARBALL}" | sha256sum -c --quiet - || \
+        { rm -f "${TARBALL}"; die "BusyBox checksum mismatch"; }
+    tar -xf "${TARBALL}" -C "${SRC_DIR}"
+    mv "${SRC_DIR}/busybox-${BUSYBOX_VERSION}" "${BUSYBOX_SRC}"
+fi
 
-# Enable static build so we don't need shared libs on target
-sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "${SRC}/.config"
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" oldconfig -s
+bmake() { make -C "${BUSYBOX_SRC}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" "$@"; }
 
-echo "[ROOTFS] Building BusyBox (static)..."
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)"
+# ---------------------------------------------------------------------------
+# 2. Configure and build BusyBox
+# ---------------------------------------------------------------------------
+if [ ! -f "${BUSYBOX_SRC}/.config" ]; then
+    log "Configuring BusyBox ${BUSYBOX_VERSION} (defconfig, static)"
+    bmake defconfig
+    # Static: no shared libraries needed on the target
+    # TC: the tc applet does not build against kernel headers >= 6.8
+    #     (CBQ qdisc removed), which Ubuntu 24.04 cross toolchains ship
+    sed -i \
+        -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
+        -e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' \
+        "${BUSYBOX_SRC}/.config"
+    bmake oldconfig < /dev/null
+fi
 
-echo "[ROOTFS] Installing BusyBox to ${ROOTFS}..."
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" \
-    CONFIG_PREFIX="${ROOTFS}" install
+log "Building BusyBox (jobs=${JOBS})"
+bmake -j"${JOBS}"
 
-# Create essential directory structure
-mkdir -p "${ROOTFS}"/{proc,sys,dev,tmp,run,mnt,boot,etc/init.d,usr/bin,usr/sbin,lib/modules}
+# ---------------------------------------------------------------------------
+# 3. Assemble the tree
+# ---------------------------------------------------------------------------
+log "Assembling ${ROOTFS_OUT}"
+rm -rf "${ROOTFS_OUT}"
+bmake CONFIG_PREFIX="${ROOTFS_OUT}" install > /dev/null
 
-# Minimal /etc/inittab
-cat > "${ROOTFS}/etc/inittab" <<'EOF'
+mkdir -p "${ROOTFS_OUT}"/{dev,proc,sys,tmp,run,mnt,root,etc/init.d,usr/bin,usr/sbin,lib/modules}
+chmod 1777 "${ROOTFS_OUT}/tmp"
+
+# BusyBox init. The shell runs on ttyS0, not on /dev/console, so it gets a
+# controlling tty: job control and Ctrl+C work (needed by oled-test 3 and 4)
+cat > "${ROOTFS_OUT}/etc/inittab" <<'EOF'
 ::sysinit:/etc/init.d/rcS
-::askfirst:-/bin/sh
+ttyS0::askfirst:-/bin/sh
 ::ctrlaltdel:/sbin/reboot
-::shutdown:/sbin/swapoff -a
+::shutdown:/etc/init.d/rcK
 ::shutdown:/bin/umount -a -r
 EOF
 
-# /etc/init.d/rcS — run all S* scripts
-cat > "${ROOTFS}/etc/init.d/rcS" <<'EOF'
+# Boot: mount pseudo filesystems, start mdev, run S??* in order
+cat > "${ROOTFS_OUT}/etc/init.d/rcS" <<'EOF'
 #!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# devtmpfs is already mounted on /dev by the kernel (CONFIG_DEVTMPFS_MOUNT)
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -a
+hostname -F /etc/hostname
 echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
 
-# Run all S* scripts
-for script in /etc/init.d/S??*; do
-    [ -x "$script" ] && "$script" start
+for s in /etc/init.d/S??*; do
+    [ -x "$s" ] && "$s" start
 done
 EOF
-chmod +x "${ROOTFS}/etc/init.d/rcS"
 
-# /etc/fstab
-cat > "${ROOTFS}/etc/fstab" <<'EOF'
-proc      /proc  proc      defaults  0 0
-sysfs     /sys   sysfs     defaults  0 0
-devtmpfs  /dev   devtmpfs  defaults  0 0
-tmpfs     /tmp   tmpfs     defaults  0 0
+# Shutdown: stop services in reverse order
+cat > "${ROOTFS_OUT}/etc/init.d/rcK" <<'EOF'
+#!/bin/sh
+for s in $(ls -r /etc/init.d/S??* 2>/dev/null); do
+    [ -x "$s" ] && "$s" stop
+done
+EOF
+chmod 755 "${ROOTFS_OUT}/etc/init.d/rcS" "${ROOTFS_OUT}/etc/init.d/rcK"
+
+# proc, sysfs and devtmpfs are mounted by rcS / the kernel, not by mount -a
+cat > "${ROOTFS_OUT}/etc/fstab" <<'EOF'
+tmpfs   /tmp      tmpfs   mode=1777  0 0
+tmpfs   /run      tmpfs   mode=0755  0 0
+devpts  /dev/pts  devpts  defaults   0 0
 EOF
 
-# hostname
-echo "bbb-oled" > "${ROOTFS}/etc/hostname"
+cat > "${ROOTFS_OUT}/etc/profile" <<'EOF'
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PS1='\u@\h:\w\$ '
+EOF
 
-# Copy our SSD1315 init script
-cp "${TOP}/rootfs/etc/init.d/S70oled" "${ROOTFS}/etc/init.d/S70oled"
-chmod +x "${ROOTFS}/etc/init.d/S70oled"
+echo "root:x:0:0:root:/root:/bin/sh" > "${ROOTFS_OUT}/etc/passwd"
+echo "root:x:0:" > "${ROOTFS_OUT}/etc/group"
+echo "bbb-oled" > "${ROOTFS_OUT}/etc/hostname"
 
-# Install kernel modules into rootfs
-if [ -d "${MODULES_OUT}" ]; then
-    echo "[ROOTFS] Installing kernel modules..."
-    cp -a "${MODULES_OUT}/lib/modules" "${ROOTFS}/lib/"
-    # Run depmod using target kernel version
-    KVER=$(ls "${MODULES_OUT}/lib/modules/" | head -1)
-    if command -v depmod >/dev/null 2>&1; then
-        depmod -b "${ROOTFS}" "${KVER}" 2>/dev/null || true
-    fi
+install -m 755 "${TOP}/rootfs/etc/init.d/S70oled" "${ROOTFS_OUT}/etc/init.d/S70oled"
+
+# ---------------------------------------------------------------------------
+# 4. In tree kernel modules (out of tree ones come from build-modules.sh)
+# ---------------------------------------------------------------------------
+if [ -d "${MODULES_OUT}/lib/modules" ]; then
+    log "Installing kernel modules"
+    cp -a "${MODULES_OUT}/lib/modules/." "${ROOTFS_OUT}/lib/modules/"
+    # modules_install leaves build/ and source/ symlinks to the host tree
+    rm -f "${ROOTFS_OUT}"/lib/modules/*/build "${ROOTFS_OUT}"/lib/modules/*/source
+else
+    log "WARNING: ${MODULES_OUT} missing, run 'make kernel' for in tree modules"
 fi
 
-echo "[ROOTFS] Done — ${ROOTFS}"
+log "Done: ${ROOTFS_OUT}"

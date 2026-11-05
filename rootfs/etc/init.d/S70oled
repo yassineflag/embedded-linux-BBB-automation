@@ -1,53 +1,44 @@
 #!/bin/sh
-### BEGIN INIT INFO
-# Provides:          ssd1315_oled mpu6050
-# Required-Start:    $local_fs
-# Required-Stop:     $local_fs
-# Default-Start:     S
-# Default-Stop:      0 6
-# Short-Description: Load SSD1315 OLED and MPU6050 IMU drivers
-### END INIT INFO
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Yassine El H. @yassineflag
+#
+# /etc/init.d/S70oled: load the SSD1315 OLED and MPU6050 IMU drivers.
+# gpio-keys is built into the kernel, the buttons need no module.
 
-OLED_DRIVER="ssd1315_oled"
-IMU_DRIVER="inv_mpu6050_i2c"
-OLED_DEV="/dev/ssd1315"
+MODULES="ssd1315_oled inv_mpu6050_i2c"
+
+is_loaded() { [ -d "/sys/module/$1" ]; }
 
 case "$1" in
-  start)
-    echo "Loading SSD1315 OLED driver..."
-    modprobe $OLED_DRIVER
-    if [ $? -eq 0 ]; then
-        echo "  $OLED_DRIVER loaded — device: $OLED_DEV"
-    else
-        echo "  ERROR: failed to load $OLED_DRIVER" >&2
-    fi
-
-    echo "Loading MPU6050 IMU driver..."
-    modprobe $IMU_DRIVER
-    if [ $? -eq 0 ]; then
-        echo "  $IMU_DRIVER loaded — data via /sys/bus/iio/devices/"
-    else
-        echo "  ERROR: failed to load $IMU_DRIVER" >&2
-    fi
-    ;;
-  stop)
-    echo "Unloading drivers..."
-    rmmod $IMU_DRIVER  2>/dev/null || true
-    rmmod $OLED_DRIVER 2>/dev/null || true
-    ;;
-  status)
-    for drv in $OLED_DRIVER $IMU_DRIVER; do
-        if lsmod | grep -q "^${drv}"; then
-            echo "$drv is loaded"
+start)
+    for m in $MODULES; do
+        if modprobe "$m"; then
+            echo "S70oled: $m loaded"
         else
-            echo "$drv is NOT loaded"
+            echo "S70oled: failed to load $m" >&2
         fi
     done
+    [ -c /dev/ssd1315 ] || echo "S70oled: /dev/ssd1315 missing, check 'dmesg | grep ssd1315'" >&2
     ;;
-  *)
-    echo "Usage: $0 {start|stop|status}"
+stop)
+    for m in inv_mpu6050_i2c ssd1315_oled; do
+        is_loaded "$m" && modprobe -r "$m"
+    done
+    ;;
+restart)
+    "$0" stop
+    "$0" start
+    ;;
+status)
+    rc=0
+    for m in $MODULES; do
+        if is_loaded "$m"; then echo "$m loaded"; else echo "$m NOT loaded"; rc=1; fi
+    done
+    exit $rc
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart|status}" >&2
     exit 1
     ;;
 esac
-
 exit 0
