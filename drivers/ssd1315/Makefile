@@ -1,13 +1,25 @@
-# Out-of-tree Makefile for ssd1315_oled kernel module
+# SPDX-License-Identifier: GPL-2.0
+# Out-of-tree build of ssd1315_oled.ko
+#
+#   make                     build against ../../src/linux
+#   make KDIR=/path/to/linux build against another configured tree
+#   make install INSTALL_MOD_PATH=<rootfs>
+
+ifneq ($(KERNELRELEASE),)
 obj-m := ssd1315_oled.o
+else
+KDIR          ?= $(CURDIR)/../../src/linux
+ARCH          ?= arm
+CROSS_COMPILE ?= arm-linux-gnueabihf-
+KMAKE = $(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
 
-KDIR ?= ../../../src/linux
-
-.PHONY: all clean
-
+.PHONY: all install clean
 all:
-	$(MAKE) -C $(KDIR) M=$(shell pwd) ARCH=arm \
-	    CROSS_COMPILE=arm-linux-gnueabihf- modules
+	$(KMAKE) modules
+
+install: all
+	$(KMAKE) INSTALL_MOD_PATH=$(INSTALL_MOD_PATH) modules_install
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(shell pwd) clean
+	$(KMAKE) clean
+endif

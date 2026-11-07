@@ -26,3 +26,9 @@ Module.symvers
 # Temporary / logs
 *.log
 *.tmp
+
+# Userspace build output
+tools/oled-test/oled-test
+
+# Interrupted downloads
+*.part

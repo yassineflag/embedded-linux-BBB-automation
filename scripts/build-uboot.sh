@@ -1,35 +1,22 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2026 Yassine El H. @yassineflag
-# scripts/build-uboot.sh: Clone and cross-compile U-Boot for BeagleBone Black
+# scripts/build-uboot.sh: fetch and cross build U-Boot (MLO + u-boot.img)
 set -euo pipefail
+STEP=U-BOOT
+# shellcheck source=env.sh
+. "$(dirname "$0")/env.sh"
 
-TOP="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${TOP}/src/u-boot"
-OUTPUT="${TOP}/output/boot"
-CROSS_COMPILE="${CROSS_COMPILE:-arm-linux-gnueabihf-}"
-UBOOT_TAG="${UBOOT_TAG:-v2024.01}"
+need_cmd git "${CROSS_COMPILE}gcc" bison flex
+mkdir -p "${SRC_DIR}" "${BOOT_OUT}"
+git_fetch "${UBOOT_GIT}" "${UBOOT_TAG}" "${UBOOT_SRC}"
 
-mkdir -p "${OUTPUT}"
+umake() { make -C "${UBOOT_SRC}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" "$@"; }
 
-# Clone if not already present
-if [ ! -d "${SRC}" ]; then
-    echo "[U-BOOT] Cloning U-Boot ${UBOOT_TAG}..."
-    git clone --depth=1 --branch "${UBOOT_TAG}" \
-        https://github.com/u-boot/u-boot.git "${SRC}"
-else
-    echo "[U-BOOT] Source already present: ${SRC}"
-fi
+[ -f "${UBOOT_SRC}/.config" ] || umake am335x_evm_defconfig
 
-echo "[U-BOOT] Configuring am335x_evm_defconfig..."
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" am335x_evm_defconfig
+log "Building (jobs=${JOBS})"
+umake -j"${JOBS}"
 
-echo "[U-BOOT] Building (jobs=$(nproc))..."
-make -C "${SRC}" ARCH=arm CROSS_COMPILE="${CROSS_COMPILE}" -j"$(nproc)"
-
-echo "[U-BOOT] Copying artifacts to ${OUTPUT}..."
-cp "${SRC}/MLO"        "${OUTPUT}/"
-cp "${SRC}/u-boot.img" "${OUTPUT}/"
-cp "${TOP}/boot/uEnv.txt" "${OUTPUT}/"
-
-echo "[U-BOOT] Done — MLO + u-boot.img → ${OUTPUT}"
+cp "${UBOOT_SRC}/MLO" "${UBOOT_SRC}/u-boot.img" "${BOOT_OUT}/"
+log "Done: MLO, u-boot.img -> ${BOOT_OUT}"

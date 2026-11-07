@@ -1,68 +1,88 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2026 Yassine El H. @yassineflag
-# scripts/make-image.sh: Assemble bootable SD card image
+# scripts/make-image.sh: assemble a bootable SD card image, without root
 #
-# Creates sdcard.img with:
-#   Partition 1: FAT32 64MB (boot: MLO, u-boot.img, uEnv.txt, zImage, DTB)
-#   Partition 2: ext4 remainder (rootfs)
+#   sector 0          MBR, disk id taken from boot/extlinux/extlinux.conf
+#   4 MiB .. 68 MiB   p1 FAT32 "BOOT", bootable: MLO, u-boot.img, zImage,
+#                     DTBs, extlinux/extlinux.conf
+#   68 MiB .. end     p2 ext4 "rootfs"
+#
+# Each filesystem is built as a standalone file (mtools for FAT, mkfs.ext4 -d
+# for ext4) and then written at its offset: no sudo, no loop devices, no
+# mounts, so it also runs in CI and containers. mkfs.ext4 runs inside
+# fakeroot so every file in the rootfs is owned by root on the target.
+#
+# The AM335x ROM loads MLO from the FAT partition flagged active. MLO is not
+# written raw: FAT mode is what SPL then uses to find u-boot.img.
 set -euo pipefail
+STEP=IMAGE
+# shellcheck source=env.sh
+. "$(dirname "$0")/env.sh"
 
-TOP="$(cd "$(dirname "$0")/.." && pwd)"
-OUTPUT="${TOP}/output"
-IMAGE="${OUTPUT}/sdcard.img"
-BOOT_OUT="${OUTPUT}/boot"
-ROOTFS_OUT="${OUTPUT}/rootfs"
+IMG_SIZE_MIB="${IMG_SIZE_MIB:-512}"
+BOOT_START_MIB=4
+BOOT_SIZE_MIB=64
+ROOT_START_MIB=$((BOOT_START_MIB + BOOT_SIZE_MIB))
+ROOT_SIZE_MIB=$((IMG_SIZE_MIB - ROOT_START_MIB))
+EXTLINUX="${TOP}/boot/extlinux/extlinux.conf"
 
-# Image size in MiB (adjust as needed)
-IMG_SIZE=512
+need_cmd sfdisk mkfs.vfat mcopy mmd mkfs.ext4 fakeroot
 
-echo "[IMAGE] Creating ${IMG_SIZE}MiB image: ${IMAGE}"
-dd if=/dev/zero of="${IMAGE}" bs=1M count="${IMG_SIZE}" status=progress
+for f in MLO u-boot.img zImage "${BOARD_DTB}"; do
+    [ -f "${BOOT_OUT}/${f}" ] || die "missing ${BOOT_OUT}/${f}, run 'make uboot kernel'"
+done
+[ -x "${ROOTFS_OUT}/bin/busybox" ] || die "rootfs missing, run 'make rootfs'"
+[ "${ROOT_SIZE_MIB}" -gt 64 ] || die "IMG_SIZE_MIB=${IMG_SIZE_MIB} is too small"
 
-echo "[IMAGE] Partitioning..."
-parted -s "${IMAGE}" \
-    mklabel msdos \
-    mkpart primary fat32   4MiB   68MiB \
-    mkpart primary ext4   68MiB  100% \
-    set 1 boot on
+# root=PARTUUID=<disk id>-02 in extlinux.conf is the single source of truth
+DISK_ID=$(sed -n 's/.*root=PARTUUID=\([0-9a-fA-F]\{8\}\)-02.*/\1/p' "${EXTLINUX}")
+[ -n "${DISK_ID}" ] || die "no root=PARTUUID=<8 hex digits>-02 in ${EXTLINUX}"
 
-# Mount image partitions via loop device
-LOOPDEV=$(sudo losetup --find --partscan --show "${IMAGE}")
-echo "[IMAGE] Loop device: ${LOOPDEV}"
+WORK=$(mktemp -d "${OUTPUT}/.image.XXXXXX")
+trap 'rm -rf "${WORK}"' EXIT
 
-# Format
-echo "[IMAGE] Formatting partitions..."
-sudo mkfs.vfat -F 32 -n "BOOT" "${LOOPDEV}p1"
-sudo mkfs.ext4 -L "rootfs"     "${LOOPDEV}p2"
+# ---------------------------------------------------------------------------
+# Boot partition (FAT32)
+# ---------------------------------------------------------------------------
+log "Building FAT32 boot partition (${BOOT_SIZE_MIB} MiB)"
+BOOT_FS="${WORK}/boot.vfat"
+mkfs.vfat -F 32 -n BOOT -C "${BOOT_FS}" $((BOOT_SIZE_MIB * 1024)) > /dev/null
+export MTOOLS_SKIP_CHECK=1
+mcopy -i "${BOOT_FS}" "${BOOT_OUT}/MLO" "${BOOT_OUT}/u-boot.img" "${BOOT_OUT}/zImage" "${BOOT_OUT}"/*.dtb ::
+mmd   -i "${BOOT_FS}" ::extlinux
+mcopy -i "${BOOT_FS}" "${EXTLINUX}" ::extlinux/extlinux.conf
 
-BOOT_MNT=$(mktemp -d)
-ROOT_MNT=$(mktemp -d)
+# ---------------------------------------------------------------------------
+# Root partition (ext4), owned by root:root
+# ---------------------------------------------------------------------------
+log "Building ext4 rootfs partition (${ROOT_SIZE_MIB} MiB)"
+ROOT_FS="${WORK}/rootfs.ext4"
+# shellcheck disable=SC2016 # expanded by the inner sh, not here
+fakeroot -- sh -c '
+    set -e
+    cp -a "$1" "$2/tree"
+    chown -R 0:0 "$2/tree"
+    mkfs.ext4 -q -F -L rootfs -d "$2/tree" "$3" "$4M"
+' sh "${ROOTFS_OUT}" "${WORK}" "${ROOT_FS}" "${ROOT_SIZE_MIB}"
 
-sudo mount "${LOOPDEV}p1" "${BOOT_MNT}"
-sudo mount "${LOOPDEV}p2" "${ROOT_MNT}"
+# ---------------------------------------------------------------------------
+# Disk image: MBR + both partitions
+# ---------------------------------------------------------------------------
+log "Writing ${IMAGE} (${IMG_SIZE_MIB} MiB, disk id 0x${DISK_ID})"
+rm -f "${IMAGE}"
+truncate -s "${IMG_SIZE_MIB}M" "${IMAGE}"
+sfdisk --quiet "${IMAGE}" <<EOF
+label: dos
+label-id: 0x${DISK_ID}
+unit: sectors
 
-echo "[IMAGE] Copying boot files..."
-# U-Boot requires MLO to be written raw to sector 256 (per AM335x TRM)
-# Also copy to FAT for reference
-sudo cp "${BOOT_OUT}/MLO"      "${BOOT_MNT}/"
-sudo cp "${BOOT_OUT}/u-boot.img" "${BOOT_MNT}/"
-sudo cp "${BOOT_OUT}/uEnv.txt"   "${BOOT_MNT}/"
-sudo cp "${BOOT_OUT}/zImage"     "${BOOT_MNT}/"
-sudo cp "${BOOT_OUT}/am335x-boneblack.dtb" "${BOOT_MNT}/"
+start=$((BOOT_START_MIB * 2048)), size=$((BOOT_SIZE_MIB * 2048)), type=c, bootable
+start=$((ROOT_START_MIB * 2048)), size=$((ROOT_SIZE_MIB * 2048)), type=83
+EOF
+dd if="${BOOT_FS}" of="${IMAGE}" bs=1M seek="${BOOT_START_MIB}" conv=notrunc,sparse status=none
+dd if="${ROOT_FS}" of="${IMAGE}" bs=1M seek="${ROOT_START_MIB}" conv=notrunc,sparse status=none
 
-# Also write MLO to the raw location (sector 256, 512-byte sectors)
-sudo dd if="${BOOT_OUT}/MLO" of="${LOOPDEV}" seek=256 bs=512 conv=notrunc 2>/dev/null
-
-echo "[IMAGE] Copying rootfs..."
-sudo cp -a "${ROOTFS_OUT}/." "${ROOT_MNT}/"
-
-echo "[IMAGE] Unmounting..."
-sudo umount "${BOOT_MNT}" "${ROOT_MNT}"
-sudo losetup -d "${LOOPDEV}"
-rmdir "${BOOT_MNT}" "${ROOT_MNT}"
-
-echo ""
-echo "[IMAGE] SD card image ready: ${IMAGE}"
-echo "  Flash to microSD (replace /dev/sdX with your card):"
-echo "    sudo dd if=${IMAGE} of=/dev/sdX bs=4M status=progress && sync"
+log "SD card image ready: ${IMAGE}"
+log "Flash it (check the device with lsblk first):"
+log "  sudo dd if=${IMAGE} of=/dev/sdX bs=4M conv=fsync status=progress"
